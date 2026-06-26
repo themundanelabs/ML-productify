@@ -1,5 +1,11 @@
 # ProductivityHub
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support%20this%20project-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/johnsebastian97)
+
+> I'm a developer who loves solving problems, improving systems, and sharing useful insights along the way. If my work helps you, your support keeps it going ☕
+
+---
+
 An open-source dashboard that brings 10 self-hosted productivity tools together in one place. One server, one login screen, one interface to launch and monitor everything.
 
 ---
