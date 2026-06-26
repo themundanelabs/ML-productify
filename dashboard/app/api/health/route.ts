@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
 import { SERVICES } from "@/lib/services";
 import type { ServiceHealth, HealthResponse } from "@/types";
 
@@ -39,6 +41,11 @@ async function checkService(service: (typeof SERVICES)[0]): Promise<ServiceHealt
 }
 
 export async function GET() {
+  const session = await getServerSession(authOptions);
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const results = await Promise.allSettled(SERVICES.map(checkService));
 
   const services: ServiceHealth[] = results.map((r, i) =>

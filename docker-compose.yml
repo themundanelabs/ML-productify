@@ -5,10 +5,8 @@
 # QUICK START:
 #   cp .env.example .env   # fill in your values
 #   ./scripts/setup.sh     # generates secrets, creates networks
-#   docker compose up -d
+#   docker compose up -d --build
 ##############################################################################
-
-version: "3.9"
 
 networks:
   hub:
@@ -70,6 +68,11 @@ services:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
+      # NEXT_PUBLIC_* vars must be available at build time — they are embedded
+      # into the client-side JS bundle during `next build`.
+      args:
+        NEXT_PUBLIC_BASE_DOMAIN: ${BASE_DOMAIN}
+        NEXT_PUBLIC_PROTOCOL: https
     container_name: hub-dashboard
     restart: unless-stopped
     networks: [hub]
@@ -279,6 +282,8 @@ services:
 
 ##############################################################################
 # 6. MEDUSA — E-Commerce
+# Medusa has no official pre-built Docker image. We build from the included
+# medusa/ directory which contains a minimal Medusa v2 server setup.
 ##############################################################################
   medusa-db:
     image: postgres:16-alpine
@@ -292,7 +297,9 @@ services:
     volumes: [medusa-db:/var/lib/postgresql/data]
 
   medusa:
-    image: medusajs/medusa:latest
+    build:
+      context: ./medusa
+      dockerfile: Dockerfile
     container_name: hub-medusa
     restart: unless-stopped
     networks: [hub]
@@ -304,6 +311,7 @@ services:
       AUTH_CORS: https://store.${BASE_DOMAIN}
       JWT_SECRET: ${MEDUSA_JWT_SECRET}
       COOKIE_SECRET: ${MEDUSA_COOKIE_SECRET}
+      NODE_ENV: production
     labels:
       - traefik.enable=true
       - traefik.http.routers.medusa.rule=Host(`store.${BASE_DOMAIN}`)
@@ -343,12 +351,37 @@ services:
       MINIO_ROOT_PASSWORD: ${APPFLOWY_MINIO_PASSWORD}
     volumes: [appflowy-minio:/data]
 
+  # GoTrue handles all authentication for AppFlowy Cloud.
+  # Without this service, users cannot register or log in to AppFlowy.
+  appflowy-gotrue:
+    image: appflowyinc/gotrue:latest
+    container_name: hub-appflowy-gotrue
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [appflowy-db]
+    environment:
+      GOTRUE_SITE_URL: https://docs.${BASE_DOMAIN}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_SECRET: ${APPFLOWY_JWT_SECRET}
+      GOTRUE_JWT_EXP: 7200
+      GOTRUE_DB_DRIVER: postgres
+      API_EXTERNAL_URL: https://docs.${BASE_DOMAIN}
+      DATABASE_URL: postgres://appflowy:${APPFLOWY_DB_PASSWORD}@appflowy-db:5432/appflowy?search_path=auth
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-587}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-}
+      GOTRUE_SMTP_PASS: ${SMTP_PASSWORD:-}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${ADMIN_EMAIL}
+      PORT: 9999
+
   appflowy:
     image: appflowyinc/appflowy_cloud:latest
     container_name: hub-appflowy
     restart: unless-stopped
     networks: [hub]
-    depends_on: [appflowy-db, appflowy-redis, appflowy-minio]
+    depends_on: [appflowy-db, appflowy-redis, appflowy-minio, appflowy-gotrue]
     environment:
       APPFLOWY_DATABASE_URL: postgres://appflowy:${APPFLOWY_DB_PASSWORD}@appflowy-db:5432/appflowy
       APPFLOWY_REDIS_URI: redis://appflowy-redis:6379
@@ -434,7 +467,9 @@ services:
     restart: unless-stopped
     networks: [hub]
     depends_on: [listmonk-db]
-    command: "./listmonk --install --idempotent --yes --config '' && ./listmonk"
+    # --install --idempotent sets up the DB schema on first run, then starts the server.
+    # Running without --config uses environment variables for all configuration.
+    command: ["sh", "-c", "./listmonk --install --idempotent --yes && ./listmonk"]
     environment:
       LISTMONK_app__address: "0.0.0.0:9000"
       LISTMONK_db__host: listmonk-db

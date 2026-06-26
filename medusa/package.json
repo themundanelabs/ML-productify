@@ -1,0 +1,13 @@
+{
+  "name": "hub-medusa",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "medusa build",
+    "start": "medusa start",
+    "dev": "medusa develop"
+  },
+  "dependencies": {
+    "@medusajs/medusa": "2.0.0",
+    "@medusajs/framework": "2.0.0"
+  }
+}

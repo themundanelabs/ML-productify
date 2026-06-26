@@ -10,6 +10,12 @@ FROM base AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# NEXT_PUBLIC_* vars are embedded into the client bundle at build time.
+# Pass your domain here so tool links work correctly in the browser.
+ARG NEXT_PUBLIC_BASE_DOMAIN=localhost
+ARG NEXT_PUBLIC_PROTOCOL=http
+ENV NEXT_PUBLIC_BASE_DOMAIN=$NEXT_PUBLIC_BASE_DOMAIN
+ENV NEXT_PUBLIC_PROTOCOL=$NEXT_PUBLIC_PROTOCOL
 RUN npm run build
 
 FROM base AS runner

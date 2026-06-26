@@ -4,7 +4,12 @@ import useSWR from "swr";
 import type { HealthResponse, ServiceHealth } from "@/types";
 import type { ServiceStatus } from "@/lib/services";
 
-const fetcher = (url: string) => fetch(url).then((r) => r.json());
+const fetcher = async (url: string) => {
+  const res = await fetch(url);
+  if (res.status === 401) return null; // unauthenticated — silently skip
+  if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
+  return res.json();
+};
 
 export function useServiceHealth() {
   const { data, error, isLoading, mutate } = useSWR<HealthResponse>(
