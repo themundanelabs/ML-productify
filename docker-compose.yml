@@ -1,0 +1,515 @@
+##############################################################################
+# ProductivityHub — docker-compose.yml
+# All 10 open-source tools + the dashboard, behind Traefik with auto SSL.
+#
+# QUICK START:
+#   cp .env.example .env   # fill in your values
+#   ./scripts/setup.sh     # generates secrets, creates networks
+#   docker compose up -d
+##############################################################################
+
+version: "3.9"
+
+networks:
+  hub:
+    external: true
+
+volumes:
+  traefik-certs:
+  cal-db:
+  plausible-db:
+  plausible-events-db:
+  ghost-db:
+  ghost-content:
+  n8n-data:
+  supabase-db:
+  supabase-storage:
+  medusa-db:
+  appflowy-db:
+  appflowy-minio:
+  appflowy-redis:
+  coolify-db:
+  coolify-redis:
+  listmonk-db:
+  penpot-assets:
+  penpot-db:
+  penpot-redis:
+
+##############################################################################
+# TRAEFIK — Reverse proxy + automatic TLS
+##############################################################################
+services:
+  traefik:
+    image: traefik:v3.2
+    container_name: hub-traefik
+    restart: unless-stopped
+    networks: [hub]
+    ports:
+      - "80:80"
+      - "443:443"
+    command:
+      - --api.dashboard=false
+      - --providers.docker=true
+      - --providers.docker.network=hub
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/certs/acme.json
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-certs:/certs
+
+##############################################################################
+# DASHBOARD — ProductivityHub UI
+##############################################################################
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: hub-dashboard
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      NEXTAUTH_URL: https://${BASE_DOMAIN}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      NEXT_PUBLIC_BASE_DOMAIN: ${BASE_DOMAIN}
+      NEXT_PUBLIC_PROTOCOL: https
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`${BASE_DOMAIN}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls.certresolver=le
+      - traefik.http.services.dashboard.loadbalancer.server.port=3100
+
+##############################################################################
+# 1. CAL.DIY — Scheduling
+##############################################################################
+  cal-db:
+    image: postgres:16-alpine
+    container_name: hub-cal-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: caldiy
+      POSTGRES_USER: caldiy
+      POSTGRES_PASSWORD: ${CAL_DB_PASSWORD}
+    volumes: [cal-db:/var/lib/postgresql/data]
+
+  cal:
+    image: calcom/cal.com:latest
+    container_name: hub-cal
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [cal-db]
+    environment:
+      DATABASE_URL: postgresql://caldiy:${CAL_DB_PASSWORD}@cal-db:5432/caldiy
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      CALENDSO_ENCRYPTION_KEY: ${CAL_ENCRYPTION_KEY}
+      NEXT_PUBLIC_WEBAPP_URL: https://cal.${BASE_DOMAIN}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.cal.rule=Host(`cal.${BASE_DOMAIN}`)
+      - traefik.http.routers.cal.entrypoints=websecure
+      - traefik.http.routers.cal.tls.certresolver=le
+      - traefik.http.services.cal.loadbalancer.server.port=3000
+
+##############################################################################
+# 2. PLAUSIBLE ANALYTICS
+##############################################################################
+  plausible-db:
+    image: postgres:16-alpine
+    container_name: hub-plausible-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: plausible
+      POSTGRES_USER: plausible
+      POSTGRES_PASSWORD: ${PLAUSIBLE_DB_PASSWORD}
+    volumes: [plausible-db:/var/lib/postgresql/data]
+
+  plausible-events-db:
+    image: clickhouse/clickhouse-server:24-alpine
+    container_name: hub-plausible-events
+    restart: unless-stopped
+    networks: [hub]
+    volumes: [plausible-events-db:/var/lib/clickhouse]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+
+  plausible:
+    image: ghcr.io/plausible/community-edition:v2
+    container_name: hub-plausible
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [plausible-db, plausible-events-db]
+    command: sh -c "sleep 10 && /entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run"
+    environment:
+      BASE_URL: https://analytics.${BASE_DOMAIN}
+      SECRET_KEY_BASE: ${PLAUSIBLE_SECRET_KEY}
+      DATABASE_URL: postgres://plausible:${PLAUSIBLE_DB_PASSWORD}@plausible-db:5432/plausible
+      CLICKHOUSE_DATABASE_URL: http://plausible-events-db:8123/plausible_events_db
+      DISABLE_REGISTRATION: "true"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.plausible.rule=Host(`analytics.${BASE_DOMAIN}`)
+      - traefik.http.routers.plausible.entrypoints=websecure
+      - traefik.http.routers.plausible.tls.certresolver=le
+      - traefik.http.services.plausible.loadbalancer.server.port=8000
+
+##############################################################################
+# 3. GHOST — Publishing
+##############################################################################
+  ghost-db:
+    image: mysql:8.0
+    container_name: hub-ghost-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GHOST_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ghost
+      MYSQL_USER: ghost
+      MYSQL_PASSWORD: ${GHOST_DB_PASSWORD}
+    volumes: [ghost-db:/var/lib/mysql]
+
+  ghost:
+    image: ghost:5-alpine
+    container_name: hub-ghost
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [ghost-db]
+    environment:
+      url: https://blog.${BASE_DOMAIN}
+      database__client: mysql
+      database__connection__host: ghost-db
+      database__connection__user: ghost
+      database__connection__password: ${GHOST_DB_PASSWORD}
+      database__connection__database: ghost
+      mail__transport: SMTP
+      mail__options__host: ${SMTP_HOST:-localhost}
+      mail__options__port: ${SMTP_PORT:-587}
+      mail__options__auth__user: ${SMTP_USER:-}
+      mail__options__auth__pass: ${SMTP_PASSWORD:-}
+    volumes: [ghost-content:/var/lib/ghost/content]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ghost.rule=Host(`blog.${BASE_DOMAIN}`)
+      - traefik.http.routers.ghost.entrypoints=websecure
+      - traefik.http.routers.ghost.tls.certresolver=le
+      - traefik.http.services.ghost.loadbalancer.server.port=2368
+
+##############################################################################
+# 4. N8N — Workflow Automation
+##############################################################################
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: hub-n8n
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      N8N_HOST: n8n.${BASE_DOMAIN}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://n8n.${BASE_DOMAIN}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: ${TIMEZONE:-UTC}
+    volumes: [n8n-data:/home/node/.n8n]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.n8n.rule=Host(`n8n.${BASE_DOMAIN}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls.certresolver=le
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+##############################################################################
+# 5. SUPABASE — Backend as a Service
+##############################################################################
+  supabase-db:
+    image: supabase/postgres:15.6.1.143
+    container_name: hub-supabase-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_PASSWORD: ${SUPABASE_DB_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes: [supabase-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  supabase-studio:
+    image: supabase/studio:20241202-71e5240
+    container_name: hub-supabase-studio
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [supabase-db]
+    environment:
+      SUPABASE_URL: https://supabase.${BASE_DOMAIN}
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      NEXT_PUBLIC_ENABLE_LOGS: "true"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase.rule=Host(`supabase.${BASE_DOMAIN}`)
+      - traefik.http.routers.supabase.entrypoints=websecure
+      - traefik.http.routers.supabase.tls.certresolver=le
+      - traefik.http.services.supabase.loadbalancer.server.port=3000
+
+  supabase-meta:
+    image: supabase/postgres-meta:v0.84.2
+    container_name: hub-supabase-meta
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [supabase-db]
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: ${SUPABASE_DB_PASSWORD}
+
+##############################################################################
+# 6. MEDUSA — E-Commerce
+##############################################################################
+  medusa-db:
+    image: postgres:16-alpine
+    container_name: hub-medusa-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: medusa
+      POSTGRES_USER: medusa
+      POSTGRES_PASSWORD: ${MEDUSA_DB_PASSWORD}
+    volumes: [medusa-db:/var/lib/postgresql/data]
+
+  medusa:
+    image: medusajs/medusa:latest
+    container_name: hub-medusa
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [medusa-db]
+    environment:
+      DATABASE_URL: postgres://medusa:${MEDUSA_DB_PASSWORD}@medusa-db:5432/medusa
+      STORE_CORS: https://store.${BASE_DOMAIN}
+      ADMIN_CORS: https://store.${BASE_DOMAIN}
+      AUTH_CORS: https://store.${BASE_DOMAIN}
+      JWT_SECRET: ${MEDUSA_JWT_SECRET}
+      COOKIE_SECRET: ${MEDUSA_COOKIE_SECRET}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.medusa.rule=Host(`store.${BASE_DOMAIN}`)
+      - traefik.http.routers.medusa.entrypoints=websecure
+      - traefik.http.routers.medusa.tls.certresolver=le
+      - traefik.http.services.medusa.loadbalancer.server.port=9000
+
+##############################################################################
+# 7. APPFLOWY CLOUD — Workspace
+##############################################################################
+  appflowy-db:
+    image: postgres:16-alpine
+    container_name: hub-appflowy-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: appflowy
+      POSTGRES_USER: appflowy
+      POSTGRES_PASSWORD: ${APPFLOWY_DB_PASSWORD}
+    volumes: [appflowy-db:/var/lib/postgresql/data]
+
+  appflowy-redis:
+    image: redis:7-alpine
+    container_name: hub-appflowy-redis
+    restart: unless-stopped
+    networks: [hub]
+    volumes: [appflowy-redis:/data]
+
+  appflowy-minio:
+    image: minio/minio:latest
+    container_name: hub-appflowy-minio
+    restart: unless-stopped
+    networks: [hub]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${APPFLOWY_MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${APPFLOWY_MINIO_PASSWORD}
+    volumes: [appflowy-minio:/data]
+
+  appflowy:
+    image: appflowyinc/appflowy_cloud:latest
+    container_name: hub-appflowy
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [appflowy-db, appflowy-redis, appflowy-minio]
+    environment:
+      APPFLOWY_DATABASE_URL: postgres://appflowy:${APPFLOWY_DB_PASSWORD}@appflowy-db:5432/appflowy
+      APPFLOWY_REDIS_URI: redis://appflowy-redis:6379
+      APPFLOWY_GOTRUE_BASE_URL: http://appflowy-gotrue:9999
+      APPFLOWY_S3_USE_MINIO: "true"
+      APPFLOWY_S3_MINIO_URL: http://appflowy-minio:9000
+      APPFLOWY_S3_ACCESS_KEY: ${APPFLOWY_MINIO_USER:-minioadmin}
+      APPFLOWY_S3_SECRET_KEY: ${APPFLOWY_MINIO_PASSWORD}
+      APPFLOWY_S3_BUCKET: appflowy
+      APPFLOWY_GOTRUE_JWT_SECRET: ${APPFLOWY_JWT_SECRET}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.appflowy.rule=Host(`docs.${BASE_DOMAIN}`)
+      - traefik.http.routers.appflowy.entrypoints=websecure
+      - traefik.http.routers.appflowy.tls.certresolver=le
+      - traefik.http.services.appflowy.loadbalancer.server.port=8000
+
+##############################################################################
+# 8. COOLIFY — Self-hosted PaaS
+##############################################################################
+  coolify-db:
+    image: postgres:16-alpine
+    container_name: hub-coolify-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: coolify
+      POSTGRES_USER: coolify
+      POSTGRES_PASSWORD: ${COOLIFY_DB_PASSWORD}
+    volumes: [coolify-db:/var/lib/postgresql/data]
+
+  coolify-redis:
+    image: redis:7-alpine
+    container_name: hub-coolify-redis
+    restart: unless-stopped
+    networks: [hub]
+    command: redis-server --requirepass ${COOLIFY_REDIS_PASSWORD}
+    volumes: [coolify-redis:/data]
+
+  coolify:
+    image: coollabsio/coolify:latest
+    container_name: hub-coolify
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [coolify-db, coolify-redis]
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /data/coolify:/data/coolify
+    environment:
+      APP_KEY: ${COOLIFY_APP_KEY}
+      DB_CONNECTION: pgsql
+      DB_HOST: coolify-db
+      DB_DATABASE: coolify
+      DB_USERNAME: coolify
+      DB_PASSWORD: ${COOLIFY_DB_PASSWORD}
+      REDIS_URL: redis://:${COOLIFY_REDIS_PASSWORD}@coolify-redis:6379
+      APP_URL: https://coolify.${BASE_DOMAIN}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.coolify.rule=Host(`coolify.${BASE_DOMAIN}`)
+      - traefik.http.routers.coolify.entrypoints=websecure
+      - traefik.http.routers.coolify.tls.certresolver=le
+      - traefik.http.services.coolify.loadbalancer.server.port=8080
+
+##############################################################################
+# 9. LISTMONK — Email Campaigns
+##############################################################################
+  listmonk-db:
+    image: postgres:16-alpine
+    container_name: hub-listmonk-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: listmonk
+      POSTGRES_USER: listmonk
+      POSTGRES_PASSWORD: ${LISTMONK_DB_PASSWORD}
+    volumes: [listmonk-db:/var/lib/postgresql/data]
+
+  listmonk:
+    image: listmonk/listmonk:latest
+    container_name: hub-listmonk
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [listmonk-db]
+    command: "./listmonk --install --idempotent --yes --config '' && ./listmonk"
+    environment:
+      LISTMONK_app__address: "0.0.0.0:9000"
+      LISTMONK_db__host: listmonk-db
+      LISTMONK_db__port: 5432
+      LISTMONK_db__user: listmonk
+      LISTMONK_db__password: ${LISTMONK_DB_PASSWORD}
+      LISTMONK_db__database: listmonk
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.listmonk.rule=Host(`campaigns.${BASE_DOMAIN}`)
+      - traefik.http.routers.listmonk.entrypoints=websecure
+      - traefik.http.routers.listmonk.tls.certresolver=le
+      - traefik.http.services.listmonk.loadbalancer.server.port=9000
+
+##############################################################################
+# 10. PENPOT — Design Tool
+##############################################################################
+  penpot-db:
+    image: postgres:16-alpine
+    container_name: hub-penpot-db
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      POSTGRES_DB: penpot
+      POSTGRES_USER: penpot
+      POSTGRES_PASSWORD: ${PENPOT_DB_PASSWORD}
+    volumes: [penpot-db:/var/lib/postgresql/data]
+
+  penpot-redis:
+    image: redis:7-alpine
+    container_name: hub-penpot-redis
+    restart: unless-stopped
+    networks: [hub]
+    volumes: [penpot-redis:/data]
+
+  penpot-backend:
+    image: penpotapp/backend:latest
+    container_name: hub-penpot-backend
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [penpot-db, penpot-redis]
+    volumes: [penpot-assets:/opt/data/assets]
+    environment:
+      PENPOT_FLAGS: enable-registration enable-login-with-password
+      PENPOT_DATABASE_URI: postgresql://penpot-db/penpot
+      PENPOT_DATABASE_USERNAME: penpot
+      PENPOT_DATABASE_PASSWORD: ${PENPOT_DB_PASSWORD}
+      PENPOT_REDIS_URI: redis://penpot-redis/0
+      PENPOT_STORAGE_BACKEND: fs
+      PENPOT_STORAGE_FS_DIRECTORY: /opt/data/assets
+      PENPOT_PUBLIC_URI: https://design.${BASE_DOMAIN}
+      PENPOT_TELEMETRY_ENABLED: "false"
+      PENPOT_SECRET_KEY: ${PENPOT_SECRET_KEY}
+
+  penpot-exporter:
+    image: penpotapp/exporter:latest
+    container_name: hub-penpot-exporter
+    restart: unless-stopped
+    networks: [hub]
+    environment:
+      PENPOT_PUBLIC_URI: https://design.${BASE_DOMAIN}
+      PENPOT_FLAGS: enable-login-with-password
+
+  penpot-frontend:
+    image: penpotapp/frontend:latest
+    container_name: hub-penpot-frontend
+    restart: unless-stopped
+    networks: [hub]
+    depends_on: [penpot-backend]
+    volumes: [penpot-assets:/opt/data/assets]
+    environment:
+      PENPOT_FLAGS: enable-registration enable-login-with-password
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.penpot.rule=Host(`design.${BASE_DOMAIN}`)
+      - traefik.http.routers.penpot.entrypoints=websecure
+      - traefik.http.routers.penpot.tls.certresolver=le
+      - traefik.http.services.penpot.loadbalancer.server.port=80

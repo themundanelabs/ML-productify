@@ -1,0 +1,26 @@
+# Environment (never commit secrets)
+.env
+.env.local
+.env.*.local
+
+# Next.js
+dashboard/.next/
+dashboard/out/
+dashboard/node_modules/
+dashboard/.env.local
+
+# Docker volumes (local dev)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
